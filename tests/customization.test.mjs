@@ -1,0 +1,93 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {spawn} from 'node:child_process';
+import {once} from 'node:events';
+import {DatabaseSync} from 'node:sqlite';
+
+test('1.2: archive authorization, session locks, media, customization, presence and two-way blocks',{timeout:30000},async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'persona12-')),base='http://127.0.0.1:32985';let child;
+ async function start(){child=spawn(process.execPath,['server.mjs'],{env:{...process.env,HOST:'127.0.0.1',PORT:'32985',DATA_DIR:dir,REGISTRATION_CODE:''},stdio:['ignore','pipe','pipe']});let errors='';child.stderr.on('data',x=>errors+=x);await Promise.race([once(child.stdout,'data'),once(child,'exit').then(()=>{throw Error(errors)})])}
+ async function stop(){const done=once(child,'exit');child.kill();await done}
+ async function req(path,method='GET',body,cookie){const r=await fetch(base+'/api'+path,{method,headers:{...(cookie?{Cookie:cookie}:{}),...(body!==undefined?{'Content-Type':'application/json'}:{})},body:body!==undefined?JSON.stringify(body):undefined});return{status:r.status,body:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]}}
+ const password='AccountPassword12';
+ try{
+  await start();const a=await req('/register','POST',{username:'alice12',password}),b=await req('/register','POST',{username:'boris12',password}),a2=await req('/login','POST',{username:'alice12',password});
+  const alice=a.cookie,alice2=a2.cookie,boris=b.cookie;
+  const cid=(await req('/chats','POST',{userId:b.body.id},alice)).body.id;
+  await req(`/chats/${cid}/appearance`,'PATCH',{enabled:true,bubbleColor:'#112233'},alice);
+  await req('/preferences','PATCH',{applyToAll:true,bubbleColor:'#334455'},alice);
+  assert.deepEqual((await req(`/chats/${cid}/appearance`,'GET',undefined,alice)).body,{},'global styling clears old chat overrides');
+  await req(`/chats/${cid}/appearance`,'PATCH',{enabled:true,fontSize:18},alice);
+  await req('/preferences','PATCH',{reset:true},alice);
+  assert.deepEqual((await req(`/chats/${cid}/appearance`,'GET',undefined,alice)).body,{},'reset clears all chat styling');
+  await req('/profile','PATCH',{bio:'Temporary bio',pronouns:'они / их'},alice);
+  const resetProfile=await req('/profile','PATCH',{reset:true},alice);
+  assert.deepEqual(resetProfile.body.profile,{},'profile reset removes custom fields');
+  assert.equal(resetProfile.body.username,'alice12','profile reset preserves account identity');
+  await req(`/chats/${cid}/messages`,'POST',{body:'Private message',nonce:'private'},alice);
+  const mid=(await req(`/chats/${cid}/messages`,'GET',undefined,alice)).body[0].id;
+  const f=await(await fetch(base+`/api/chats/${cid}/upload`,{method:'POST',headers:{Cookie:alice,'X-Filename':'private.txt','Content-Type':'text/plain'},body:'private bytes'})).json();
+  const root=(await req('/archive','GET',undefined,alice)).body[0];
+  const nested=(await req('/archive','POST',{parentId:root.id,name:'Личное',password:'nested-pass'},alice)).body.id;
+  assert.equal((await req(`/archive/${nested}/unlock`,'POST',{password:'wrong'},alice)).status,403);
+  assert.equal((await req(`/archive/${nested}/unlock`,'POST',{password:'nested-pass'},alice)).status,200);
+  const deep=(await req('/archive','POST',{parentId:nested,name:'Вложенная'},alice)).body.id;assert.ok(deep);
+  assert.equal((await req(`/archive/chats/${cid}`,'PATCH',{folderId:deep},alice)).status,200);
+  assert.equal((await req(`/chats/${cid}/messages`,'GET',undefined,alice)).status,200);
+  assert.equal((await req(`/chats/${cid}/messages`,'GET',undefined,alice2)).status,423,'grants are session-specific');
+  assert.equal((await req(`/archive/${nested}/unlock`,'POST',{password:'nested-pass'},boris)).status,404);
+  assert.equal((await req(`/chats/${cid}/messages`,'GET',undefined,boris)).status,200,'other participant retains their own access');
+  await req(`/archive/${root.id}/password`,'PATCH',{password:'root-password'},alice);
+  const guard=spawn(process.execPath,['rollback-guard.mjs',join(dir,'persona.sqlite')],{stdio:'pipe'});assert.equal((await once(guard,'exit'))[0],2,'rollback cannot silently bypass protected folders');
+  assert.equal((await req('/archive','GET',undefined,alice)).body.length,1,'locked parent hides child names');
+  assert.ok(!(await req('/chats','GET',undefined,alice)).body.some(c=>c.id===cid),'locked chat metadata excluded');
+  for(const [path,method,body] of [[`/chats/${cid}/messages`,'GET'],[`/chats/${cid}/messages`,'POST',{body:'bypass'}],[`/chats/${cid}/read`,'POST',{}],[`/chats/${cid}/nickname`,'PATCH',{nickname:'bypass'}],[`/messages/${mid}`,'PATCH',{body:'bypass'}],[`/messages/${mid}`,'DELETE'],[`/messages/${mid}/reaction`,'POST',{emoji:'❤️'}],['/reports','POST',{messageId:mid,reason:'bypass'}],[`/archive/chats/${cid}`,'PATCH',{folderId:null}],['/chats','POST',{userId:b.body.id}],[`/chats/${cid}/appearance`,'GET']])assert.equal((await req(path,method,body,alice)).status,423,path);
+  assert.equal((await fetch(base+'/api/files/'+f.id,{headers:{Cookie:alice}})).status,423);
+  assert.equal((await req(`/archive/${nested}/unlock`,'POST',{password:'nested-pass'},alice)).status,423);
+  await req(`/archive/${root.id}/unlock`,'POST',{password:'root-password'},alice);
+  assert.equal((await req(`/chats/${cid}/messages`,'GET',undefined,alice)).status,423,'parent password change revoked descendant grant');
+  await req(`/archive/${nested}/unlock`,'POST',{password:'nested-pass'},alice);
+  assert.equal((await req(`/chats/${cid}/messages`,'GET',undefined,alice)).status,200);
+  const revision=(await req('/sync','GET',undefined,alice)).body.revision;
+  const db=new DatabaseSync(join(dir,'persona.sqlite'));db.prepare('UPDATE folder_grants SET expires=0').run();db.close();
+  assert.notEqual((await req('/sync','GET',undefined,alice)).body.revision,revision,'expired grant invalidates client state');
+  assert.equal((await req(`/chats/${cid}/messages`,'GET',undefined,alice)).status,423);
+  await req(`/archive/${root.id}/unlock`,'POST',{password:'root-password'},alice2);
+  await req(`/archive/${nested}/unlock`,'POST',{password:'nested-pass'},alice2);
+  await req(`/archive/chats/${cid}`,'PATCH',{folderId:null},alice2);
+  assert.equal((await req(`/chats/${cid}/messages`,'GET',undefined,alice)).status,200);
+  await req('/archive/lock','POST',{},alice2);
+  assert.equal((await req('/preferences','PATCH',{accent:'red;url(javascript:bad)'},alice)).status,400);
+  assert.equal((await req('/profile','PATCH',{links:[{label:'x',url:'javascript:alert(1)'}]},alice)).status,400);
+  assert.equal((await req('/profile','PATCH',null,alice)).status,400);
+  assert.equal((await req('/profile','PATCH',{links:[{label:'Website',url:'https://example.com/profile'}],avatarShape:'circle',pronouns:'он/его'},alice)).status,200);
+  assert.equal((await req('/users/alice12','GET',undefined,boris)).body.profile.links[0].url,'https://example.com/profile');
+  const gif=Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7','base64');
+  async function upload(bytes,kind,cookie){return fetch(base+'/api/profile-media',{method:'POST',headers:{Cookie:cookie,'Content-Type':'image/gif','X-Media-Kind':kind},body:bytes})}
+  assert.equal((await upload('<html>bad</html>','banner',alice)).status,400);
+  assert.equal((await upload(gif,'avatar',alice)).status,400);
+  const banner=await(await upload(gif,'banner',alice)).json();
+  assert.equal((await req('/profile','PATCH',{bannerMedia:{...banner,x:20,y:80,zoom:1.7}},alice)).status,200);
+  assert.equal((await req('/profile','PATCH',{bannerMedia:banner},boris)).status,400,'media cannot be adopted by another account');
+  const mediaResponse=await fetch(base+'/api/profile-media/'+banner.id,{headers:{Cookie:boris}});assert.equal(mediaResponse.headers.get('content-type'),'image/gif');assert.deepEqual(Buffer.from(await mediaResponse.arrayBuffer()),gif,'GIF bytes remain animated');
+  const bg=await(await upload(gif,'background',alice)).json();
+  assert.equal((await fetch(base+'/api/profile-media/'+bg.id,{headers:{Cookie:boris}})).status,404);
+  const pref={theme:'light',accent:'#9988ff',wallpaperMedia:bg,sidebarSide:'right',sendSide:'left',toolbarOrder:['voice','send','attach'],fontSize:18,presence:'dnd'};
+  assert.equal((await req('/preferences','PATCH',pref,alice)).status,200);
+  assert.equal((await req('/preferences','GET',undefined,alice2)).body.sendSide,'left','appearance syncs across devices');
+  await req('/sync','GET',undefined,alice);assert.equal((await req('/users/alice12','GET',undefined,boris)).body.presence,'dnd');
+  await req('/preferences','PATCH',{presence:'offline'},alice);assert.equal((await req('/users/alice12','GET',undefined,boris)).body.presence,'offline');
+  await req('/block','POST',{userId:b.body.id},alice);
+  assert.equal((await req('/users/boris12','GET',undefined,alice)).body.blockedByMe,true);
+  assert.equal((await req('/users/alice12','GET',undefined,boris)).body.blockedMe,true);
+  for(const who of [alice,boris])assert.equal((await req(`/chats/${cid}/messages`,'POST',{body:'blocked'},who)).status,403,'block prevents sends both ways');
+  assert.equal((await fetch(base+`/api/chats/${cid}/upload`,{method:'POST',headers:{Cookie:alice,'Content-Type':'text/plain'},body:'blocked'})).status,403);
+  await req('/block','POST',{userId:b.body.id,remove:true},alice);
+  assert.equal((await req(`/chats/${cid}/messages`,'POST',{body:'allowed'},alice)).status,200);
+  await stop();await start();assert.equal((await req('/preferences','GET',undefined,alice)).body.sendSide,'left');assert.equal((await req('/me','GET',undefined,alice)).body.profile.bannerMedia.zoom,1.7);
+  const integrity=new DatabaseSync(join(dir,'persona.sqlite'));assert.equal(integrity.prepare('PRAGMA integrity_check').get().integrity_check,'ok');assert.equal(integrity.prepare('PRAGMA foreign_key_check').all().length,0);integrity.close();
+ }finally{if(child?.exitCode===null)await stop();await rm(dir,{recursive:true,force:true})}
+});

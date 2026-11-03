@@ -1,0 +1,63 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {spawn} from 'node:child_process';
+import {once} from 'node:events';
+import {DatabaseSync} from 'node:sqlite';
+test('1.3: scoped roles, channels, privacy, check-in quota/expiry/media and restart',{timeout:30000},async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'persona13-')),base='http://127.0.0.1:32986';let child;
+ async function start(){child=spawn(process.execPath,['server.mjs'],{env:{...process.env,HOST:'127.0.0.1',PORT:'32986',DATA_DIR:dir,REGISTRATION_CODE:''},stdio:['ignore','pipe','pipe']});let errors='';child.stderr.on('data',x=>errors+=x);await Promise.race([once(child.stdout,'data'),once(child,'exit').then(()=>{throw Error(errors)})])}
+ async function stop(){const exit=once(child,'exit');child.kill();await exit}
+ async function req(path,method='GET',body,cookie){const r=await fetch(base+'/api'+path,{method,headers:{...(cookie?{Cookie:cookie}:{}),...(body!==undefined?{'Content-Type':'application/json'}:{})},body:body===undefined?undefined:JSON.stringify(body)});return {status:r.status,body:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]}}
+ const database=()=>new DatabaseSync(join(dir,'persona.sqlite'));
+ try{await start();const users=[];for(const username of ['owner13','member13','outside13'])users.push(await req('/register','POST',{username,password:'TestPassword13'}));const [a,b,c]=users,[ac,bc,cc]=users.map(u=>u.cookie);
+ const gid=(await req('/chats','POST',{title:'Roles'},ac)).body.id;
+ assert.equal((await req(`/chats/${gid}/members`,'POST',{userIds:[b.body.id]},ac)).status,200);
+ assert.equal((await req(`/chats/${gid}/community`,'PATCH',{announcement:true},ac)).status,200);
+ assert.equal((await req(`/chats/${gid}/messages`,'POST',{body:'No'},bc)).status,403);
+ const role={name:'Редактор',color:'#7755aa',permissions:{write:true,editGroup:true,invite:true}};
+ assert.equal((await req(`/chats/${gid}/roles`,'POST',role,bc)).status,403);
+ assert.equal((await req(`/chats/${gid}/roles`,'POST',{...role,permissions:{manageRoles:true}},ac)).status,400);
+ await req(`/chats/${gid}/roles`,'POST',role,ac);
+ const rid=(await req(`/chats/${gid}/community`,'GET',undefined,ac)).body.roles[0].id;
+ assert.equal((await req(`/chats/${gid}/assign-role`,'POST',{userId:b.body.id,roleId:rid},ac)).status,200);
+ assert.equal((await req(`/chats/${gid}/messages`,'POST',{body:'Allowed'},bc)).status,200);
+ assert.equal((await req(`/chats/${gid}/community`,'PATCH',{description:'Role editor'},bc)).status,200);
+ assert.equal((await req(`/chats/${gid}/community`,'PATCH',{announcement:false},bc)).status,403);
+ const other=(await req('/chats','POST',{title:'Other'},ac)).body.id;await req(`/chats/${other}/members`,'POST',{userIds:[b.body.id]},ac);
+ assert.equal((await req(`/chats/${other}/assign-role`,'POST',{userId:b.body.id,roleId:rid},ac)).status,404);
+ assert.equal((await req(`/chats/${gid}/community`,'GET',undefined,cc)).status,403);
+ await req('/privacy','PATCH',{groupInvites:false,directMessages:false,showPresence:false},cc);
+ assert.equal((await req(`/chats/${gid}/members`,'POST',{userIds:[c.body.id]},bc)).status,403);
+ assert.equal((await req('/chats','POST',{userId:c.body.id},ac)).status,403);
+ const gc=(await req('/chats','GET',undefined,ac)).body.find(x=>x.id===gid);assert.equal(gc.members.find(m=>m.id===b.body.id).customRole.color,role.color);
+ const joined=await req('/join','POST',{invite:gc.invite},cc);assert.equal(joined.status,200,'self join permitted despite disabling direct invitations');
+ await req(`/chats/${gid}/roles/${rid}`,'DELETE',undefined,ac);assert.equal((await req(`/chats/${gid}/messages`,'POST',{body:'Revoked'},bc)).status,403);
+ const dm=(await req('/chats','POST',{userId:b.body.id},ac)).body.id;
+ const check=(await req('/checkins','POST',{chatId:dm},ac)).body.id;assert.ok(check);
+ assert.equal((await req('/checkins','POST',{chatId:dm},ac)).status,429);
+ assert.equal((await req(`/checkins/${check}/seen`,'POST',{},cc)).status,403);
+ await req(`/checkins/${check}/seen`,'POST',{},bc);
+ const jpeg=Buffer.from([255,216,255,224,0,16,255,217]);
+ const photo=await fetch(base+`/api/checkins/${check}/photo`,{method:'POST',headers:{Cookie:bc,'Content-Type':'image/jpeg'},body:jpeg});assert.equal(photo.status,200);
+ assert.equal((await req(`/checkins/${check}/refuse`,'POST',{},bc)).status,409);
+ assert.equal((await req('/me','GET',undefined,bc)).body.checkins.score,1);
+ const file=(await req(`/chats/${dm}/messages`,'GET',undefined,ac)).body.find(m=>m.file)?.file.id;assert.ok(file);
+ assert.equal((await fetch(base+'/api/files/'+file,{headers:{Cookie:cc}})).status,403);
+ await req('/privacy','PATCH',{showStats:false},bc);assert.equal((await req('/users/member13','GET',undefined,ac)).body.checkins,null);
+ const db=database();db.prepare('UPDATE checkins SET created=? WHERE sender=?').run(Date.now()-86401000,a.body.id);db.close();
+ const next=(await req('/checkins','POST',{chatId:dm},ac)).body.id;await req(`/checkins/${next}/seen`,'POST',{},bc);
+ const db2=database();db2.prepare('UPDATE checkins SET deadline=? WHERE id=?').run(Date.now()-1,next);db2.close();
+ await req('/checkins','GET',undefined,bc);assert.equal((await req('/me','GET',undefined,bc)).body.checkins.score,0);
+ const db3=database();db3.prepare('UPDATE checkins SET created=? WHERE sender=?').run(Date.now()-86401000,a.body.id);db3.close();
+ await req('/checkins','POST',{chatId:dm},ac);await req('/privacy','PATCH',{checkins:false},bc);
+ assert.equal((await req('/checkins','POST',{chatId:dm},ac)).status,403);
+ assert.equal((await req('/checkins','GET',undefined,bc)).body[0].state,'cancelled');
+ assert.equal((await req('/profile','PATCH',{socials:{telegram:'https://evil.test'}},bc)).status,400);
+ assert.equal((await req('/profile','PATCH',{socials:{telegram:'@gvmskool',discord:'sample.user'}},bc)).status,200);
+ await stop();await start();assert.equal((await req('/privacy','GET',undefined,bc)).body.checkins,false);assert.equal((await req('/me','GET',undefined,bc)).body.checkins.successful,1);
+ const final=database();assert.equal(final.prepare('PRAGMA integrity_check').get().integrity_check,'ok');assert.deepEqual(final.prepare('PRAGMA foreign_key_check').all(),[]);final.close();const verify=spawn(process.execPath,['verify-upgrade.mjs',join(dir,'persona.sqlite'),join(dir,'persona.sqlite')],{stdio:'pipe'});assert.equal((await once(verify,'exit'))[0],0,'upgrade verifier supports populated 1.3 tables');const guard=spawn(process.execPath,['rollback-guard.mjs',join(dir,'persona.sqlite')],{stdio:'pipe'});assert.equal((await once(guard,'exit'))[0],2,'rollback refuses loss of role/privacy protection');
+ }finally{if(child?.exitCode===null)await stop();await rm(dir,{recursive:true,force:true})}
+});

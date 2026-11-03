@@ -1,0 +1,11 @@
+PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT UNIQUE,name TEXT,password TEXT,profile TEXT DEFAULT '{}',created INTEGER);
+CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,user_id INTEGER REFERENCES users(id),expires INTEGER);
+CREATE TABLE IF NOT EXISTS chats(id INTEGER PRIMARY KEY,title TEXT,kind TEXT,owner INTEGER REFERENCES users(id),theme TEXT DEFAULT '#a3e7c6',description TEXT DEFAULT '',invite TEXT UNIQUE);
+CREATE TABLE IF NOT EXISTS members(chat_id INTEGER REFERENCES chats(id),user_id INTEGER REFERENCES users(id),role TEXT DEFAULT 'member',nickname TEXT DEFAULT '',last_read INTEGER DEFAULT 0,PRIMARY KEY(chat_id,user_id));
+CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY,chat_id INTEGER REFERENCES chats(id),user_id INTEGER REFERENCES users(id),body TEXT,file_id TEXT,reply_to INTEGER,created INTEGER,edited INTEGER DEFAULT 0,pinned INTEGER DEFAULT 0,nonce TEXT,UNIQUE(user_id,nonce));
+CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY,user_id INTEGER,chat_id INTEGER,name TEXT,mime TEXT,size INTEGER);
+CREATE TABLE IF NOT EXISTS reactions(message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,user_id INTEGER,emoji TEXT,PRIMARY KEY(message_id,user_id,emoji));
+CREATE TABLE IF NOT EXISTS blocks(user_id INTEGER,target_id INTEGER,PRIMARY KEY(user_id,target_id));
+CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY,user_id INTEGER,message_id INTEGER,reason TEXT,created INTEGER);
+CREATE INDEX IF NOT EXISTS msg_chat ON messages(chat_id,id);

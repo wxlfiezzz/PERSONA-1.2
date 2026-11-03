@@ -1,0 +1,32 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      APP_ORIGIN: https://${DOMAIN}
+      COOKIE_SECURE: '1'
+      REGISTRATION_CODE: ${REGISTRATION_CODE:?Set a private registration code}
+    volumes:
+      - persona-data:/app/data
+    expose:
+      - '3000'
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:?Set the domain}
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - app
+volumes:
+  persona-data:
+    external: true
+    name: persona-data
+  caddy-data:
+  caddy-config:

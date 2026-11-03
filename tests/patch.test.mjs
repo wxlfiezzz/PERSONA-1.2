@@ -1,0 +1,88 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {DatabaseSync} from 'node:sqlite';
+import {createHash,scryptSync} from 'node:crypto';
+import {mkdtemp,rm,mkdir,writeFile,readFile,cp} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {spawn} from 'node:child_process';
+import {once} from 'node:events';
+
+test('1.1 migrates an existing database, preserves auth, delivers once and enforces permissions', {timeout:30000}, async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'persona-migration-')),port=32982,base=`http://127.0.0.1:${port}`;
+ let child,stderr='';const baseline=await mkdtemp(join(tmpdir(),'persona-baseline-'));
+ const password='ExistingPassword123',token='existing-session-token',cookie='persona='+token;
+ const db=new DatabaseSync(join(dir,'persona.sqlite'));
+ db.exec(await readFile(new URL('./legacy-schema.sql',import.meta.url),'utf8'));
+ const hash='salt:'+scryptSync(password,'salt',64).toString('hex');
+ for(const [id,name] of [[1,'existing'],[2,'persona_news'],[3,'friend'],[4,'outsider']])db.prepare('INSERT INTO users(id,username,name,password,created) VALUES(?,?,?,?,?)').run(id,name,name,hash,1);
+ db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(createHash('sha256').update(token).digest('hex'),1,Date.now()+86400000);
+ db.exec("INSERT INTO chats(id,title,kind,owner,invite) VALUES(1,'Old group','group',1,'existing-invite'); INSERT INTO members(chat_id,user_id,role) VALUES(1,1,'owner'),(1,3,'member'); INSERT INTO messages(id,chat_id,user_id,body,created,nonce) VALUES(1,1,1,'Old message',1,'old-nonce'); INSERT INTO files VALUES('old-file',1,1,'old.txt','text/plain',9)");
+ const oldUser=db.prepare('SELECT * FROM users WHERE id=1').get();db.close();await mkdir(join(dir,'uploads'));await writeFile(join(dir,'uploads','old-file'),'old bytes');
+ async function start(entry='server.mjs'){child=spawn(process.execPath,[entry],{env:{...process.env,PORT:String(port),HOST:'127.0.0.1',DATA_DIR:dir,REGISTRATION_CODE:'',NEWS_AUTO_PUBLISH:'1',REALTIME_TRANSPORT:'poll'},stdio:['ignore','pipe','pipe']});child.stderr.on('data',b=>stderr+=b);await Promise.race([once(child.stdout,'data'),once(child,'exit').then(()=>{throw Error(stderr)})])}
+ async function stop(){const done=once(child,'exit');child.kill();await done}
+ async function req(path,method='GET',data,auth=cookie){const r=await fetch(base+'/api'+path,{method,headers:{Cookie:auth,...(data?{'Content-Type':'application/json'}:{})},body:data?JSON.stringify(data):undefined});return{status:r.status,body:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]}}
+ try{
+  await cp(dir,baseline,{recursive:true});
+  await start();
+  const verifier=spawn(process.execPath,['verify-upgrade.mjs',join(baseline,'persona.sqlite'),join(dir,'persona.sqlite')],{stdio:'pipe'});let verificationErrors='';verifier.stderr.on('data',b=>verificationErrors+=b);assert.equal((await once(verifier,'exit'))[0],0,verificationErrors);
+  assert.equal((await req('/me')).body.id,1,'old cookie works');
+  assert.equal((await req('/login','POST',{username:'existing',password})).status,200,'old password works');
+  assert.equal((await req('/chats/1/messages')).body[0].body,'Old message');
+  assert.equal(await(await fetch(base+'/api/files/old-file',{headers:{Cookie:cookie}})).text(),'old bytes');
+  const list=(await req('/chats')).body,news=list.find(c=>c.kind==='news'),bot=news.members.find(m=>m.system);
+  assert.ok(news);assert.equal(bot.username,'persona_news_2','human username collision is preserved');
+  assert.equal((await req('/users/persona_news')).body.system,false);
+  assert.equal((await req('/users/PeRsOnA_NeWs_2')).body.system,true);
+  assert.equal((await req('/users/no_such_user')).status,404);
+  assert.equal((await req('/login','POST',{username:bot.username,password})).status,401);
+  const newsMessages=(await req(`/chats/${news.id}/messages`)).body;assert.equal(newsMessages.length,1);
+  for(const [action,method,data] of [['messages','POST',{body:'fake news'}],['upload','POST',{}],['members','POST',{userIds:[3]}],['','PATCH',{title:'Fake'}]])assert.equal((await req(`/chats/${news.id}${action?'/'+action:''}`,method,data)).status,403);
+  assert.equal((await req('/messages/'+newsMessages[0].id,'DELETE')).status,403);
+  assert.equal((await req(`/messages/${newsMessages[0].id}/reaction`,'POST',{emoji:'❤️'})).status,403);
+  const newcomer=await req('/register','POST',{username:'newcomer',password});
+  assert.equal((await req('/chats','GET',null,newcomer.cookie)).body.filter(c=>c.kind==='news').length,1);
+  const friend=await req('/login','POST',{username:'friend',password}),out=await req('/login','POST',{username:'outsider',password});
+  assert.equal((await req('/chats/1/members','POST',{userIds:[4]},friend.cookie)).status,403);
+  assert.equal((await req('/chats/1/members','POST',{userIds:[4]},out.cookie)).status,403);
+  assert.equal((await req('/chats/1/members','POST',{userIds:[4,999999]})).status,404);
+  assert.equal((await req('/chats/1/messages','GET',null,out.cookie)).status,403,'batch additions roll back on invalid users');
+  await req('/block','POST',{userId:1},out.cookie);
+  assert.equal((await req('/chats/1/members','POST',{userIds:[4]})).status,403);
+  await req('/block','POST',{userId:1,remove:true},out.cookie);
+  const rev=(await req('/sync','GET',null,out.cookie)).body.revision;
+  assert.equal((await req('/chats/1/members','POST',{userIds:[4,4]})).status,200);
+  assert.notEqual((await req('/sync','GET',null,out.cookie)).body.revision,rev);
+  assert.equal((await req('/chats/1/members','POST',{userIds:[4]})).status,200,'repeat is idempotent');
+  assert.equal((await req('/chats/1/messages','GET',null,out.cookie)).status,200);
+  await req('/chats/1/members','PATCH',{userId:3,role:'admin'});
+  assert.equal((await req('/chats/1/members','POST',{userIds:[newcomer.body.id]},friend.cookie)).status,200);
+  assert.equal((await req('/chats/1/members','POST',{userIds:[bot.id]})).status,404);
+  const dm=await req('/chats','POST',{userId:3});
+  assert.equal((await req(`/chats/${dm.body.id}/members`,'POST',{userIds:[4]})).status,400);
+  assert.equal((await req(`/chats/${dm.body.id}/members`,'PATCH',{userId:3,remove:true})).status,400);
+  const before=(await req('/sync','GET',null,out.cookie)).body.revision;
+  await req('/chats/1/members','PATCH',{userId:4,remove:true});
+  assert.notEqual((await req('/sync','GET',null,out.cookie)).body.revision,before,'removed user gets invalidation');
+  assert.equal((await req('/chats/1/messages','GET',null,out.cookie)).status,403);
+  const stable=(await req('/sync')).body.revision;assert.equal((await req('/sync')).body.revision,stable);
+  const img=await fetch(base+'/api/chats/1/upload',{method:'POST',headers:{Cookie:cookie,'Content-Type':'image/png','X-Filename':'test.png'},body:Buffer.from('89504e470d0a1a0a','hex')});const fid=(await img.json()).id;
+  const inline=await fetch(base+'/api/files/'+fid,{headers:{Cookie:cookie}});assert.match(inline.headers.get('content-disposition'),/^inline/);
+  assert.match((await fetch(base+'/api/files/'+fid+'?download=1',{headers:{Cookie:cookie}})).headers.get('content-disposition'),/^attachment/);
+  assert.equal((await fetch(base+'/api/files/'+fid,{headers:{Cookie:out.cookie}})).status,403);
+  await stop();await start();await stop();await start();
+  assert.equal((await req(`/chats/${news.id}/messages`)).body.length,1,'restart never redelivers');
+  assert.equal((await req('/me')).body.id,1);
+  const check=new DatabaseSync(join(dir,'persona.sqlite'));
+  assert.deepEqual(check.prepare('SELECT * FROM users WHERE id=1').get(),oldUser);
+  assert.equal(check.prepare('PRAGMA integrity_check').get().integrity_check,'ok');
+  assert.equal(check.prepare('PRAGMA foreign_key_check').all().length,0);
+  assert.equal(check.prepare('SELECT count(*) n FROM schema_migrations').get().n,3);
+  assert.equal(check.prepare('SELECT count(*) n FROM release_deliveries').get().n,5);
+  check.close();
+  await stop();await start('tests/fixtures/legacy-server.mjs');
+  assert.equal((await req('/me')).body.id,1,'old application can reuse the upgraded volume');
+  assert.equal((await req('/chats/1/messages')).body[0].body,'Old message');
+  assert.equal((await req('/login','POST',{username:'existing',password})).status,200);
+ }finally{if(child?.exitCode===null)await stop();await rm(dir,{recursive:true,force:true});await rm(baseline,{recursive:true,force:true})}
+});
